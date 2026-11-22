@@ -1,0 +1,8 @@
+{
+  "name": "cc-codex",
+  "metadata": { "description": "Claude Code to Codex project delegation and task recovery." },
+  "owner": { "name": "Ding141" },
+  "plugins": [
+    { "name": "cc-codex", "source": "./plugins/cc-codex", "description": "Claude leads project design and review, Codex implements." }
+  ]
+}

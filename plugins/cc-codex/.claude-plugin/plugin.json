@@ -1,0 +1,6 @@
+{
+  "name": "cc-codex",
+  "version": "0.1.0",
+  "description": "Connect Claude Code planning and review to resumable Codex engineering tasks.",
+  "author": { "name": "Ding141" }
+}
