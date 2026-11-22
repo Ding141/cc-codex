@@ -2,28 +2,37 @@
 
 在 Claude Code 里输入一次 `/cc-codex:init`，为当前项目建立 Claude 规划和审查、Codex 实现和测试的协作方式。后续直接向 Claude 描述任务。每个任务有独立记录和 Codex 线程，可以在同一个项目里来回切换。
 
-## 从 GitHub 安装
+## 从系统终端安装，一次供当前用户的所有项目使用
 
-准备好 Claude Code、已登录的 Codex CLI 和 Python 3.9 或更高版本。插件只使用 Python 标准库。先在**系统终端**运行以下命令，确认两个 CLI 都能启动，并查看 Codex 登录状态。如果提示未登录，运行 `codex login`。
+在 **PowerShell、Terminal 或其他系统终端**的任意目录运行这一行（Claude Code 2.1.292 及以上）：
 
 ```shell
-claude --version
-codex --version
-codex login status
-python --version
+claude plugin install cc-codex --marketplace Ding141/cc-codex --scope user
 ```
 
-若本机的 Python 命令是 `python3` 或 `py -3`，可用对应命令检查版本。Windows 支持原生 Codex 可执行文件和标准 npm 全局安装。
+这条命令会从 GitHub 注册插件市场并安装插件。`--scope user` 表示本机**当前操作系统用户**的所有 Claude Code 项目都可以使用。安装后，在另一个目录运行 `claude plugin list --json`，可看到 `cc-codex@cc-codex`、`"scope": "user"` 和 `"enabled": true`。新开的 Claude Code 会话会加载插件，已经打开的会话可在对话框中单独输入 `/reload-plugins`。[Claude Code 官方安装文档](https://code.claude.com/docs/en/discover-plugins#add-and-install-from-your-shell)
 
-进入**你要开发的项目根目录**，运行 `claude`。以下三条是 **Claude Code 对话框里的命令**，逐条输入：
+**每个项目首次使用时**，在要开发的项目根目录启动 `claude`，在对话框输入 `/cc-codex:init`。这一步为该目录建立协作规则并检查 Codex 读写。准备好已登录的 Codex CLI 和 Python 3.9 或更高版本；可在终端运行 `codex login status` 检查登录，或运行 `codex login` 登录。插件只使用 Python 标准库，支持 `python`、`python3` 或 Windows 上的 `py -3`。Windows 支持原生 Codex 可执行文件和标准 npm 全局安装。
+
+### 如果已经打开了 Add Marketplace 窗口
+
+在 **Enter marketplace source** 输入框中，只粘贴下面这一行并按回车：
 
 ```text
-/plugin marketplace add Ding141/cc-codex
-/plugin install cc-codex@cc-codex
-/reload-plugins
+Ding141/cc-codex
 ```
 
-第一条从 GitHub 添加插件目录，第二条安装 `cc-codex`（希望在自己的多个项目使用时选择用户范围），第三条让当前会话加载插件。输入 `/plugin` 可在 Installed 页确认插件已启用。安装一次后，在每个需要接入的项目里分别初始化。[Claude Code 插件安装说明](https://code.claude.com/docs/en/discover-plugins)
+看到 `is not a valid GitHub owner/repo shorthand` 且引号里还包含 `/plugin install` 或 `/reload-plugins`，说明后面的命令也被粘进了来源栏。清空输入框后重新填写上面的仓库名。
+
+市场添加成功后，回到 **Claude Code 主对话框**，单独输入以下命令，并在安装界面选择 **User** 范围：
+
+```text
+/plugin install cc-codex@cc-codex
+```
+
+Anthropic 的官方 skills 仓库也采用先注册市场、再从市场安装具体插件的方式。[官方 skills 仓库安装示例](https://github.com/anthropics/skills#claude-code)
+
+如果旧版 CLI 提示不认识 `--marketplace`，也可在**系统终端**先运行 `claude plugin marketplace add Ding141/cc-codex`，成功后再运行 `claude plugin install cc-codex@cc-codex --scope user`。
 
 ## 插件命令
 
