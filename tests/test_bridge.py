@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,14 +19,20 @@ class ProjectTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        home = patch.dict(os.environ, CC_CODEX_HOME=str(self.root / "user-data"))
+        home.start()
+        self.addCleanup(home.stop)
 
     def command(self, *args, body=""):
+        return self.cli("--project", str(self.root), *args, body=body)
+
+    def cli(self, *args, body=""):
         stream = io.TextIOWrapper(io.BytesIO(body.encode("utf-8")))
-        with patch.object(sys, "argv", ["bridge", "--project", str(self.root), *args]), \
+        with patch.object(sys, "argv", ["bridge", *args]), \
                 patch.object(sys, "stdin", stream):
             return bridge.main()
 
-    def initialize(self):
+    def initialize(self, root=None):
         def probe(root, prompt, model, effort, probe):
             challenge, = root.glob(".cc-codex/probe-*/input.txt")
             value = challenge.read_bytes()
@@ -33,7 +40,7 @@ class ProjectTest(unittest.TestCase):
             return value.decode()
 
         with patch.object(bridge, "execute", probe):
-            self.command("init")
+            self.cli("--project", str(root or self.root), "init")
 
     def test_existing_instructions_survive_repeated_init(self):
         agents = self.root / "AGENTS.md"
@@ -116,6 +123,73 @@ class ProjectTest(unittest.TestCase):
                 out.write("\nsys.exit(17)\n")
             with self.assertRaisesRegex(RuntimeError, "exit 17"):
                 codex_cli.execute(self.root, "retry")
+
+    def test_project_switch_preserves_each_windows_selection_and_dispatch_root(self):
+        other = self.root / "网站 后台"
+        other.mkdir()
+        self.initialize()
+        self.initialize(other)
+        one = lambda *args, **kw: self.cli("--session", "one", *args, **kw)
+        two = lambda *args, **kw: self.cli("--session", "two", *args, **kw)
+        for window in (one, two):
+            window("project", "use", str(self.root))
+        a = one("task", "new", "theme")
+        c = two("task", "new", "login")
+        self.assertEqual((a["ref"], c["ref"]), ("T1", "T2"))
+        one("project", "use", other.name)
+        b = one("task", "new", "dashboard")
+        self.assertEqual(b["ref"], "T1")
+        self.assertEqual(one("status", self.root.name)["selected"]["id"], a["id"])
+        self.assertEqual(one("status")["root"], str(other))
+        self.assertEqual(two("status")["selected"]["id"], c["id"])
+        with patch.object(bridge, "execute", return_value="implemented B") as dispatch:
+            one("run", "T1", body="implement it")
+            self.assertEqual(dispatch.call_args.args[0], other)
+            self.assertIn("dashboard", dispatch.call_args.args[1])
+        one("project", "use", str(self.root))
+        self.assertEqual(one("status")["selected"]["status"], "planned")
+        self.assertEqual(one("status")["selected"]["id"], a["id"])
+        self.assertEqual(one("task", "use", "T2")["selected"]["id"], c["id"])
+
+    def test_legacy_task_refs_persist_across_new_tasks_and_updates(self):
+        self.initialize()
+        old = self.command("new", "old", body="legacy brief")
+        path = self.root / bridge.STATE / "tasks" / (old["id"] + ".json")
+        data = bridge.read(path)
+        del data["number"]
+        bridge.save(path, data)
+        self.assertEqual(self.command("task", "list")[0]["ref"], "T1")
+        self.assertNotIn("number", bridge.read(path))  # Viewing legacy records is read-only.
+        self.assertEqual(self.command("new", "next", body="new brief")["ref"], "T2")
+        self.command("checkpoint", "T1", "done", body="checked")
+        self.assertEqual(self.command("show", "T1")["id"], old["id"])
+        self.assertEqual([t["ref"] for t in self.command("task", "list")], ["T2"])
+        self.assertEqual(len(self.command("task", "list", "--all")), 2)
+
+    def test_failed_switch_and_duplicate_names_preserve_selection(self):
+        roots = [self.root / group / "site" for group in ("first", "second")]
+        for root in roots:
+            root.mkdir(parents=True)
+            self.initialize(root)
+        session = ("--session", "demo")
+        self.cli(*session, "project", "use", str(roots[0]))
+        for target in ("site", str(self.root), "unknown"):
+            with self.assertRaises(ValueError):
+                self.cli(*session, "project", "use", target)
+        self.assertEqual(self.cli(*session, "status")["root"], str(roots[0]))
+        self.assertEqual(sum(p["current"] for p in self.cli(*session, "project", "list")), 1)
+
+    def test_navigation_snapshot_is_read_only_and_never_dispatches(self):
+        with patch.object(bridge, "execute", side_effect=AssertionError("unwanted dispatch")):
+            self.assertFalse(self.command("status")["initialized"])
+            self.assertEqual(self.command("project", "list"), [])
+            self.assertEqual(list(self.root.iterdir()), [])
+        self.initialize()
+        with patch.object(bridge, "execute", side_effect=AssertionError("unwanted dispatch")):
+            task = self.command("--session", "a", "task", "new", "plan only")
+            self.command("--session", "b", "task", "use", task["ref"])
+            self.assertEqual(self.command("--session", "b", "status")["selected"]["status"], "planned")
+            self.assertIsNone(self.command("--session", "new-window", "status")["selected"])
 
 
 if __name__ == "__main__":

@@ -8,11 +8,13 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sqlite3
 import sys
 import tempfile
 import uuid
 
 from codex_cli import execute, model_catalog
+import navigation
 
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
@@ -150,18 +152,71 @@ def stdin_text():
     return body
 
 
+def task_records(state, migrate=False):
+    """Give pre-0.2 records deterministic numbers; persist them under the writer lock."""
+    records = []
+    for path in sorted((state / "tasks").glob("*.json")):
+        task = read(path)
+        if task["id"] != path.stem or not re.fullmatch("[a-f0-9]{32}", path.stem):
+            raise ValueError(f"Task record ID mismatch: {path.name}")
+        records.append(task)
+    used = {t["number"] for t in records if "number" in t}
+    number = 0
+    for task in records:
+        if "number" not in task:
+            number += 1
+            while number in used:
+                number += 1
+            task["number"] = number
+            if migrate:
+                save(state / "tasks" / (task["id"] + ".json"), task)
+    return records
+
+
+def task_summary(task):
+    return {"ref": f"T{task['number']}", **{key: task[key] for key in ("id", "title", "status", "updated")}}
+
+
+def resolve_task(state, ref):
+    if re.fullmatch("[a-f0-9]{32}", ref):
+        path = state / "tasks" / (ref + ".json")
+        if path.is_file():
+            task = read(path)
+            if task["id"] != ref:
+                raise ValueError(f"Task record ID mismatch: {path.name}")
+            if "number" in task:
+                return task
+    for task in task_records(state):
+        if ref == task["id"] or ref.upper() == f"T{task['number']}":
+            return task
+    raise ValueError(f"Unknown task {ref}. Use task list --all in this project.")
+
+
+def project_status(root, session):
+    state = root / STATE
+    selected = navigation.selected_task(session, root)
+    records = sorted(task_records(state), key=lambda t: t["updated"], reverse=True)
+    task = next((t for t in records if t["id"] == selected), None)
+    details = None
+    if task:
+        details = {**task_summary(task), **{key: task[key] for key in
+                   ("brief", "result", "checkpoint", "error") if task.get(key)}}
+    marker = state / "project.json"
+    return {"project": root.name, "root": str(root), "initialized": marker.is_file(),
+            "last_probe": read(marker) if marker.is_file() else None, "selected": details,
+            "other_open_tasks": [task_summary(t) for t in records if t["id"] != selected and t["status"] != "done"]}
+
+
 def task_command(root, state, args):
     folder = state / "tasks"
-    folder.mkdir(exist_ok=True)
     if args.command == "new":
-        task = {"id": uuid.uuid4().hex, "title": args.title, "brief": stdin_text(),
+        records = task_records(state, migrate=True)
+        folder.mkdir(exist_ok=True)
+        task = {"id": uuid.uuid4().hex, "number": max((t["number"] for t in records), default=0) + 1,
+                "title": args.title, "brief": args.title if args.title_only else stdin_text(),
                 "status": "planned", "thread_id": None}
     else:
-        if not re.fullmatch("[a-f0-9]{32}", args.id):
-            raise ValueError("Use the exact task ID from list.")
-        task = read(folder / (args.id + ".json"))
-        if task["id"] != args.id:
-            raise ValueError("Task record ID mismatch.")
+        task = resolve_task(state, args.id)
     path = folder / (task["id"] + ".json")
 
     def persist(**changes):
@@ -169,9 +224,14 @@ def task_command(root, state, args):
         save(path, task)
 
     if args.command == "show":
-        return task
+        return {**task, "ref": f"T{task['number']}"}
     if args.command == "new":
         persist()
+        if args.session:
+            try:
+                navigation.remember(root, args.session, task["id"])
+            except (sqlite3.Error, OSError) as exc:
+                raise ValueError(f"Task {task['id']} was saved. Retry task use to select it: {exc}") from exc
     elif args.command == "checkpoint":
         persist(status=args.status, checkpoint=stdin_text())
     else:
@@ -196,14 +256,24 @@ def task_command(root, state, args):
             raise
         persist(status="review", result=result, error=None)
         return {"id": task["id"], "status": task["status"], "result": result}
-    return {key: task[key] for key in ("id", "title", "status")}
+    return task_summary(task)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", default=".", help="exact project root (default: cwd)")
+    parser.add_argument("--project", help="explicit project root (overrides session selection)")
+    parser.add_argument("--session", help="Claude session ID for project and task selection")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("models", help="compact local Codex model catalog")
+    status = commands.add_parser("status")
+    status.add_argument("target", nargs="?")
+    project = commands.add_parser("project").add_subparsers(dest="action", required=True)
+    project.add_parser("list")
+    project.add_parser("use").add_argument("target")
+    tasks = commands.add_parser("task").add_subparsers(dest="action", required=True)
+    tasks.add_parser("list").add_argument("--all", action="store_true")
+    tasks.add_parser("use").add_argument("id")
+    tasks.add_parser("new").add_argument("title")
     init = commands.add_parser("init")
     new = commands.add_parser("new")
     new.add_argument("title")
@@ -222,10 +292,18 @@ def main():
     args = parser.parse_args()
     if args.command == "models":
         return model_catalog()
-    root = Path(args.project).resolve(strict=True)
+    root = Path(args.project).resolve(strict=True) if args.project else navigation.active_project(args.session)
+    if args.command == "project" and args.action == "list":
+        return [{"project": p.name, "root": str(p), "current": p == root} for p in navigation.projects()]
+    if getattr(args, "target", None):
+        root = navigation.resolve_project(args.target)
     state = root / STATE
     if state.is_symlink() or (state / "tasks").is_symlink():
         raise ValueError("Use project-local cc-codex state.")
+    if args.command == "status":
+        return project_status(root, args.session)
+    if args.command in ("project", "task") and args.action != "list" and not args.session:
+        raise ValueError("Pass --session <Claude session ID> before the command to save a selection.")
     if args.command == "init":
         state.mkdir(exist_ok=True)
         ignore = state / ".gitignore"
@@ -235,18 +313,30 @@ def main():
             raise ValueError("Local task directory must be gitignored before initialization.")
     elif not (state / "project.json").is_file():
         raise ValueError("Initialize this project with /cc-codex:init.")
+    if args.command == "project":
+        result = project_status(root, args.session)
+        navigation.remember(root, args.session)
+        return result
+    args.title_only = args.command == "task" and args.action == "new"
+    if args.command == "task":
+        if args.action == "use":
+            task = resolve_task(state, args.id)
+            navigation.remember(root, args.session, task["id"])
+            return project_status(root, args.session)
+        args.command = args.action
     if args.command == "list":
-        rows = []
-        for path in sorted((state / "tasks").glob("*.json")):
-            task = read(path)
-            if args.all or task["status"] != "done":
-                rows.append({key: task[key] for key in ("id", "title", "status", "updated")})
+        selected = navigation.selected_task(args.session, root)
+        rows = [dict(task_summary(task), selected=task["id"] == selected)
+                for task in task_records(state) if args.all or task["status"] != "done"]
         return sorted(rows, key=lambda item: item["updated"], reverse=True)
     if args.command == "show":
         return task_command(root, state, args)
     with writer(state):
         if args.command == "init":
-            return initialize(root, state, args)
+            result = initialize(root, state, args)
+            task_records(state, migrate=True)
+            navigation.remember(root, args.session)
+            return result
         return task_command(root, state, args)
 
 
@@ -254,5 +344,5 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     try:
         print(json.dumps(main(), ensure_ascii=False))
-    except (OSError, RuntimeError, ValueError, KeyError) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
         sys.exit(str(error))

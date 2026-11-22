@@ -3,7 +3,9 @@ name: work
 description: In a cc-codex initialized project, dispatch engineering to Codex, switch or recover tasks, and review changes for delivery.
 ---
 
-Claude owns user communication, product decisions, design, architecture and review. Handle planning discussions directly. For implementation in an initialized project, use the bridge bundled at `${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py`. Run it with Python 3 from the initialized root or pass `--project <absolute-root>` before the subcommand. For independent child projects select the matching root. Use UTF-8 stdin for prose, for example a Bash quoted here-document or a UTF-8 file redirected to stdin. Never interpolate the user's prose into shell code.
+User request: $ARGUMENTS
+
+Claude owns user communication, design, architecture and review. From the Claude launch project, first run `python "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" --session "${CLAUDE_SESSION_ID}" status`. Use the returned absolute root for every file read, diff, render, test and review. Load that root's applicable Claude/project guidance. Use absolute file paths and set the shell working directory explicitly (e.g. `git -C "<root>" diff`). For subsequent bridge calls in this operation pass both `--session "${CLAUDE_SESSION_ID}"` and `--project "<returned root>"` before the subcommand. If host access fails, report it before dispatch. Send prose on UTF-8 stdin using literal quoting.
 
 In a project without cc-codex initialization, use the ordinary Claude workflow unless the user requests setup.
 
@@ -11,7 +13,9 @@ If the host denies executing the bridge, surface that permission request to the 
 
 ### Select the task
 
-Run `list` for unfinished IDs and titles, then `show ID` for the chosen task. Use `list --all` for a follow-up to a finished task. Match intent to the title and brief. A correction or review continues its task; a distinct goal gets a new ID. If “continue” matches multiple tasks, ask which title. Keep unrelated records out of context.
+For a bare /cc-codex:work, use only the selected task from status. With no selection, list refs and ask the user to choose or create one. For a selected planned task, recover the brief and execute the remaining assignment. In review, inspect the existing result before considering another dispatch. In running or blocked, reconcile the actual process, changes and blocker first. For done, report the completion checkpoint and wait for a new request.
+
+For a named goal use `list` (or `list --all` for finished work), then `task use ID` for an existing task. Match a correction to its earlier task; clarify ambiguous requests. Use `show ID` for full details. Status-only questions end at reporting. A selection-only request ends after saving the selection.
 
 For a new goal run `new "short title"` with the agreed goal, scope, decisions and acceptance criteria on stdin. Persist new decisions, outstanding work and review evidence with `checkpoint ID planned|review|blocked|done` and a short **replacement** checkpoint on stdin. Keep earlier decisions that still apply. Put human requests and checkpoints in the task record. Reserve project guidance for enduring conventions.
 
