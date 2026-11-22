@@ -1,6 +1,7 @@
 {
   "name": "cc-codex",
-  "version": "0.2.0",
-  "description": "Connect Claude Code planning and review to resumable Codex engineering tasks.",
+  "version": "0.3.0",
+  "description": "Claude Code plans and reviews; Codex CLI implements. Resumable per-task threads.",
+  "license": "MIT",
   "author": { "name": "Ding141" }
 }

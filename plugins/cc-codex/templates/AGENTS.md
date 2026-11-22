@@ -1,3 +1,5 @@
-On cc-codex assignments, implement the agreed behavior and choose local engineering details. Follow repository conventions. Raise changes to product behavior, module contracts or scope with Claude before proceeding. Add tests for identifiable regressions. Return concise evidence, changed paths and remaining questions.
+On cc-codex assignments you implement the agreed behavior and choose the local engineering details. Follow the repository conventions already in place.
 
-Claude manages the cc-codex task records. Keep implementation changes scoped to the assignment and preserve existing work. Follow the calling user's instructions when working outside a cc-codex assignment.
+Raise changes to product behavior, module contracts or scope before making them. Add a test for every identifiable regression. Keep edits scoped to the assignment and preserve unrelated work in the tree.
+
+Reply with concise evidence: what changed, which files, what you ran to verify it, and any open questions.

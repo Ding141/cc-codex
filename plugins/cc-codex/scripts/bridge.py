@@ -1,4 +1,21 @@
-"""Project initialization, dispatch and resumable task records for cc-codex."""
+"""cc-codex bridge: project setup, task records and Codex dispatch.
+
+Every command prints one JSON document to stdout.
+
+    bridge.py [--session ID] [--project ROOT] models
+    bridge.py [--session ID] [--project ROOT] status [TARGET]
+    bridge.py [--session ID] [--project ROOT] init [--model M] [--effort E]
+    bridge.py [--session ID] [--project ROOT] project list
+    bridge.py [--session ID] [--project ROOT] project use TARGET
+    bridge.py [--session ID] [--project ROOT] task list [--all]
+    bridge.py [--session ID] [--project ROOT] task show REF
+    bridge.py [--session ID] [--project ROOT] task use REF
+    bridge.py [--session ID] [--project ROOT] task new TITLE
+    bridge.py [--session ID] [--project ROOT] task checkpoint REF STATUS
+    bridge.py [--session ID] [--project ROOT] task run REF [--model M] [--effort E] [--fresh]
+
+Text bodies (brief, checkpoint, assignment) are read from UTF-8 stdin.
+"""
 
 import argparse
 from contextlib import contextmanager
@@ -8,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +39,7 @@ TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
 BEGIN = b"<!-- cc-codex:begin -->"
 END = b"<!-- cc-codex:end -->"
 STATE = ".cc-codex"
+STATUSES = ("planned", "running", "review", "blocked", "done")
 
 
 def timestamp():
@@ -65,14 +84,12 @@ def probe_directory(state):
     try:
         yield probe
     finally:
-        for name in ("input.txt", "output.txt"):
-            (probe / name).unlink(missing_ok=True)
-        probe.rmdir()
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 @contextmanager
 def writer(state):
-    # One Codex writer at a time per worktree. OS releases locks on process exit.
+    # One Codex writer at a time per worktree. The OS releases the lock on exit.
     with (state / "writer.lock").open("a+b") as handle:
         try:
             if os.name == "nt":
@@ -88,10 +105,11 @@ def writer(state):
 
 
 def instruction(path, content):
+    """Return file bytes with the cc-codex block replaced or appended."""
     if path.is_symlink():
         raise ValueError(f"Inspect linked instructions manually: {path}")
     old = path.read_bytes() if path.exists() else b""
-    old.decode("utf-8-sig")  # Preserve hand-written bytes; reject incompatible encodings.
+    old.decode("utf-8-sig")  # Reject incompatible encodings; preserve hand-written bytes.
     newline = b"\r\n" if b"\r\n" in old else b"\n"
     block = newline.join([BEGIN, *content.splitlines(), END])
     if BEGIN in old or END in old:
@@ -104,8 +122,13 @@ def instruction(path, content):
 
 
 def initialize(root, state, args):
+    """Probe Codex end to end, then write project guidance.
+
+    The readiness marker is written before the probe and only replaced with a
+    successful result afterwards, so a failed probe keeps dispatch blocked.
+    """
     readiness = state / "project.json"
-    save(readiness, {"ready": False})
+    save(readiness, {"ready": False, "checked": timestamp(), "error": None})
     instructions = {}
     for name in ("CLAUDE.md", "AGENTS.md"):
         path = root / name
@@ -118,7 +141,7 @@ def initialize(root, state, args):
         if name == "CLAUDE.md" and not path.exists() and (root / "AGENTS.md").is_file():
             content = b"@AGENTS.md\n\n" + content
         instructions[path] = (original, content)
-    # Probe in the same working root and sandbox used by ordinary tasks.
+
     with probe_directory(state) as probe:
         token = secrets.token_hex(16)
         (probe / "input.txt").write_text(token, encoding="ascii")
@@ -133,27 +156,35 @@ def initialize(root, state, args):
             raise ValueError("Probe failed: the contents of output.txt differ from input.txt.")
         if token not in reply:
             raise ValueError(f"Probe failed: the reply omitted the value read. Reply: {reply[:800]}")
+
     for path, (original, data) in instructions.items():
         current = path.read_bytes() if path.exists() else None
         if current != original:
             raise ValueError(f"{path} changed during the probe. Retry with the latest instructions.")
         if original != data:
             atomic_write(path, data)
-    result = {"ready": True, "checked": timestamp(), "probe_model": args.model or "CLI default",
+    result = {"ready": True, "checked": timestamp(), "error": None,
+              "probe_model": args.model or "CLI default",
               "probe_effort": args.effort or "CLI default"}
     save(readiness, result)
     return result
 
 
-def stdin_text():
-    body = sys.stdin.buffer.read().decode("utf-8-sig").strip()
-    if not body:
+def stdin_text(required=True):
+    body = ""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is not None:
+        try:
+            body = stream.read().decode("utf-8-sig").strip()
+        except (OSError, AttributeError):
+            body = ""
+    if not body and required:
         raise ValueError("Expected a UTF-8 task brief or checkpoint on stdin.")
     return body
 
 
 def task_records(state, migrate=False):
-    """Give pre-0.2 records deterministic numbers; persist them under the writer lock."""
+    """Load task records, giving pre-0.2 records deterministic T-numbers."""
     records = []
     for path in sorted((state / "tasks").glob("*.json")):
         task = read(path)
@@ -174,7 +205,8 @@ def task_records(state, migrate=False):
 
 
 def task_summary(task):
-    return {"ref": f"T{task['number']}", **{key: task[key] for key in ("id", "title", "status", "updated")}}
+    return {"ref": f"T{task['number']}",
+            **{key: task[key] for key in ("id", "title", "status", "updated")}}
 
 
 def resolve_task(state, ref):
@@ -202,108 +234,152 @@ def project_status(root, session):
         details = {**task_summary(task), **{key: task[key] for key in
                    ("brief", "result", "checkpoint", "error") if task.get(key)}}
     marker = state / "project.json"
+    probe = read(marker) if marker.is_file() else None
     return {"project": root.name, "root": str(root), "initialized": marker.is_file(),
-            "last_probe": read(marker) if marker.is_file() else None, "selected": details,
-            "other_open_tasks": [task_summary(t) for t in records if t["id"] != selected and t["status"] != "done"]}
+            "ready": bool(probe and probe.get("ready")), "last_probe": probe,
+            "selected": details,
+            "open_tasks": [task_summary(t) for t in records
+                           if t["id"] != selected and t["status"] != "done"]}
 
 
-def task_command(root, state, args):
-    folder = state / "tasks"
-    if args.command == "new":
-        records = task_records(state, migrate=True)
-        folder.mkdir(exist_ok=True)
-        task = {"id": uuid.uuid4().hex, "number": max((t["number"] for t in records), default=0) + 1,
-                "title": args.title, "brief": args.title if args.title_only else stdin_text(),
-                "status": "planned", "thread_id": None}
-    else:
-        task = resolve_task(state, args.id)
-    path = folder / (task["id"] + ".json")
+def require_ready(state):
+    marker = state / "project.json"
+    probe = read(marker) if marker.is_file() else None
+    if not (probe and probe.get("ready")):
+        raise ValueError("Run /cc-codex:init successfully before dispatch.")
+
+
+def task_new(state, session, title):
+    records = task_records(state, migrate=True)
+    (state / "tasks").mkdir(exist_ok=True)
+    task = {"id": uuid.uuid4().hex,
+            "number": max((t["number"] for t in records), default=0) + 1,
+            "title": title, "brief": stdin_text(required=False) or title,
+            "status": "planned", "thread_id": None, "updated": timestamp()}
+    save(state / "tasks" / (task["id"] + ".json"), task)
+    if session:
+        try:
+            navigation.remember(state.parent, session, task["id"])
+        except (sqlite3.Error, OSError) as exc:
+            raise ValueError(f"Task {task['id']} was saved. Retry task use to select it: {exc}") from exc
+    return task_summary(task)
+
+
+def task_run(root, state, args):
+    require_ready(state)
+    task = resolve_task(state, args.id)
+    path = state / "tasks" / (task["id"] + ".json")
+    if task["status"] == "running":
+        raise ValueError("Inspect the interrupted run and checkpoint its actual state first.")
+    assignment = stdin_text()
+    thread = None if args.fresh else task["thread_id"]
+    prompt = assignment
+    if not thread:
+        prompt = "\n".join(filter(None, [task["brief"], task.get("checkpoint"),
+                                        task.get("result"), assignment]))
+    model = args.model or task.get("model")
+    effort = args.effort or task.get("effort")
 
     def persist(**changes):
         task.update(changes, updated=timestamp())
         save(path, task)
 
-    if args.command == "show":
-        return {**task, "ref": f"T{task['number']}"}
-    if args.command == "new":
-        persist()
-        if args.session:
-            try:
-                navigation.remember(root, args.session, task["id"])
-            except (sqlite3.Error, OSError) as exc:
-                raise ValueError(f"Task {task['id']} was saved. Retry task use to select it: {exc}") from exc
-    elif args.command == "checkpoint":
-        persist(status=args.status, checkpoint=stdin_text())
-    else:
-        if not read(state / "project.json")["ready"]:
-            raise ValueError("Run /cc-codex:init successfully before dispatch.")
-        if task["status"] == "running":
-            raise ValueError("Inspect the interrupted run and checkpoint its actual state first.")
-        assignment = stdin_text()
-        thread = None if args.fresh else task["thread_id"]
-        prompt = assignment
-        if not thread:
-            prompt = "\n".join(filter(None, [task["brief"], task.get("checkpoint"),
-                                            task.get("result"), assignment]))
-        model = args.model or task.get("model")
-        effort = args.effort or task.get("effort")
-        persist(status="running", assignment=assignment, model=model, effort=effort)
-        try:
-            result = execute(root, prompt, model, effort, thread,
-                             on_thread=lambda value: persist(thread_id=value))
-        except (OSError, RuntimeError, ValueError, KeyboardInterrupt) as exc:
-            persist(status="blocked", error=str(exc) or "Interrupted")
-            raise
-        persist(status="review", result=result, error=None)
-        return {"id": task["id"], "status": task["status"], "result": result}
+    persist(status="running", assignment=assignment, model=model, effort=effort, error=None)
+    try:
+        result = execute(root, prompt, model, effort, thread,
+                         on_thread=lambda value: persist(thread_id=value))
+    except (OSError, RuntimeError, ValueError, KeyboardInterrupt) as exc:
+        persist(status="blocked", error=str(exc) or "Interrupted")
+        raise
+    persist(status="review", result=result)
+    return {"id": task["id"], "ref": f"T{task['number']}", "status": task["status"],
+            "result": result}
+
+
+def task_checkpoint(state, args):
+    task = resolve_task(state, args.id)
+    task.update(status=args.status, checkpoint=stdin_text(), error=None, updated=timestamp())
+    save(state / "tasks" / (task["id"] + ".json"), task)
     return task_summary(task)
 
 
+def project_list(root):
+    rows = []
+    for path in navigation.projects():
+        rows.append({"project": path.name, "root": str(path), "current": path == root,
+                     "initialized": (path / STATE / "project.json").is_file()})
+    return rows
+
+
+def resolve_root(args):
+    if args.project:
+        try:
+            return Path(args.project).expanduser().resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"Project directory not found: {args.project}") from exc
+    root = navigation.active_project(args.session)
+    if getattr(args, "target", None):
+        root = navigation.resolve_project(args.target)
+    return root
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", help="explicit project root (overrides session selection)")
     parser.add_argument("--session", help="Claude session ID for project and task selection")
     commands = parser.add_subparsers(dest="command", required=True)
+
     commands.add_parser("models", help="compact local Codex model catalog")
-    status = commands.add_parser("status")
+    status = commands.add_parser("status", help="read-only project and task status")
     status.add_argument("target", nargs="?")
+
+    init = commands.add_parser("init", help="probe Codex and write project guidance")
+    init.add_argument("--model")
+    init.add_argument("--effort")
+
     project = commands.add_parser("project").add_subparsers(dest="action", required=True)
     project.add_parser("list")
     project.add_parser("use").add_argument("target")
+
     tasks = commands.add_parser("task").add_subparsers(dest="action", required=True)
     tasks.add_parser("list").add_argument("--all", action="store_true")
+    tasks.add_parser("show").add_argument("id")
     tasks.add_parser("use").add_argument("id")
     tasks.add_parser("new").add_argument("title")
-    init = commands.add_parser("init")
-    new = commands.add_parser("new")
-    new.add_argument("title")
-    listing = commands.add_parser("list")
-    listing.add_argument("--all", action="store_true")
-    show = commands.add_parser("show")
-    run = commands.add_parser("run")
-    checkpoint = commands.add_parser("checkpoint")
-    for command in (show, run, checkpoint):
-        command.add_argument("id")
-    for command in (init, run):
-        command.add_argument("--model")
-        command.add_argument("--effort")
+    checkpoint = tasks.add_parser("checkpoint")
+    checkpoint.add_argument("id")
+    checkpoint.add_argument("status", choices=STATUSES)
+    run = tasks.add_parser("run")
+    run.add_argument("id")
+    run.add_argument("--model")
+    run.add_argument("--effort")
     run.add_argument("--fresh", action="store_true", help="start a replacement Codex thread")
-    checkpoint.add_argument("status", choices=["planned", "review", "blocked", "done"])
+
     args = parser.parse_args()
     if args.command == "models":
         return model_catalog()
-    root = Path(args.project).resolve(strict=True) if args.project else navigation.active_project(args.session)
+
+    root = resolve_root(args)
     if args.command == "project" and args.action == "list":
-        return [{"project": p.name, "root": str(p), "current": p == root} for p in navigation.projects()]
-    if getattr(args, "target", None):
-        root = navigation.resolve_project(args.target)
+        return project_list(root)
+
     state = root / STATE
     if state.is_symlink() or (state / "tasks").is_symlink():
         raise ValueError("Use project-local cc-codex state.")
+
     if args.command == "status":
         return project_status(root, args.session)
-    if args.command in ("project", "task") and args.action != "list" and not args.session:
-        raise ValueError("Pass --session <Claude session ID> before the command to save a selection.")
+
+    if args.command == "project":
+        if not args.session:
+            raise ValueError("Pass --session <Claude session ID> before the command to save a selection.")
+        if not (state / "project.json").is_file():
+            raise ValueError("Project is not initialized. Run /cc-codex:init there first.")
+        result = project_status(root, args.session)
+        navigation.remember(root, args.session)
+        return result
+
     if args.command == "init":
         state.mkdir(exist_ok=True)
         ignore = state / ".gitignore"
@@ -311,38 +387,48 @@ def main():
             atomic_write(ignore, b"*\n")
         elif b"*" not in ignore.read_bytes().splitlines():
             raise ValueError("Local task directory must be gitignored before initialization.")
-    elif not (state / "project.json").is_file():
+        with writer(state):
+            result = initialize(root, state, args)
+            task_records(state, migrate=True)
+            navigation.remember(root, args.session)
+            return {**result, "project": root.name, "root": str(root)}
+
+    if not (state / "project.json").is_file():
         raise ValueError("Initialize this project with /cc-codex:init.")
-    if args.command == "project":
-        result = project_status(root, args.session)
-        navigation.remember(root, args.session)
-        return result
-    args.title_only = args.command == "task" and args.action == "new"
-    if args.command == "task":
-        if args.action == "use":
-            task = resolve_task(state, args.id)
-            navigation.remember(root, args.session, task["id"])
-            return project_status(root, args.session)
-        args.command = args.action
-    if args.command == "list":
-        selected = navigation.selected_task(args.session, root)
-        rows = [dict(task_summary(task), selected=task["id"] == selected)
-                for task in task_records(state) if args.all or task["status"] != "done"]
-        return sorted(rows, key=lambda item: item["updated"], reverse=True)
-    if args.command == "show":
-        return task_command(root, state, args)
+    action = args.action
+
     with writer(state):
         if args.command == "init":
             result = initialize(root, state, args)
             task_records(state, migrate=True)
             navigation.remember(root, args.session)
-            return result
-        return task_command(root, state, args)
+            return {**result, "project": root.name, "root": str(root)}
+        if action == "new":
+            return task_new(state, args.session, args.title)
+        if action == "use":
+            task = resolve_task(state, args.id)
+            navigation.remember(root, args.session, task["id"])
+            return project_status(root, args.session)
+        if action == "checkpoint":
+            return task_checkpoint(state, args)
+        if action == "run":
+            return task_run(root, state, args)
+        if action == "show":
+            task = resolve_task(state, args.id)
+            return {**task, "ref": f"T{task['number']}"}
+        if action == "list":
+            selected = navigation.selected_task(args.session, root)
+            rows = [dict(task_summary(task), selected=task["id"] == selected)
+                    for task in task_records(state) if args.all or task["status"] != "done"]
+            return sorted(rows, key=lambda item: item["updated"], reverse=True)
+        raise ValueError(f"Unknown task action: {action}")
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     try:
         print(json.dumps(main(), ensure_ascii=False))
+    except KeyboardInterrupt:
+        sys.exit("Interrupted")
     except (OSError, RuntimeError, ValueError, KeyError, sqlite3.Error) as error:
-        sys.exit(str(error))
+        sys.exit(str(error) or error.__class__.__name__)

@@ -1,4 +1,4 @@
-"""Invoke Codex without a shell. Forward only the thread ID and final response."""
+"""Invoke the Codex CLI without a shell and forward only the final reply."""
 
 import json
 import os
@@ -10,9 +10,21 @@ import uuid
 
 
 def launcher():
-    program = shutil.which("codex.exe" if os.name == "nt" else "codex")
-    if program:
-        return [program]
+    """Return the argv prefix that starts the Codex CLI on this machine.
+
+    Order: an explicit CODEX_BIN override, a native executable, then the
+    npm shim on Windows (resolved to its node entry point so no shell is used).
+    """
+    override = os.environ.get("CODEX_BIN")
+    if override:
+        path = Path(override).expanduser()
+        if path.is_file():
+            return [str(path)]
+        raise ValueError(f"CODEX_BIN does not point to a file: {override}")
+    for name in ("codex.exe", "codex"):
+        program = shutil.which(name)
+        if program:
+            return [program]
     if os.name == "nt":
         shim = shutil.which("codex.cmd")
         node = shutil.which("node")
@@ -20,7 +32,7 @@ def launcher():
             entry = Path(shim).parent / "node_modules/@openai/codex/bin/codex.js"
             if entry.is_file():
                 return [node, str(entry)]
-    raise ValueError("Codex CLI missing from PATH. Install Codex CLI and check codex --version.")
+    raise ValueError("Codex CLI not found. Install it (npm i -g @openai/codex) and check `codex --version`.")
 
 
 def model_catalog():
@@ -38,6 +50,11 @@ def model_catalog():
 
 
 def execute(root, prompt, model=None, effort=None, thread=None, on_thread=None, probe=False):
+    """Run one Codex turn; return its final agent message.
+
+    `thread` resumes an existing Codex thread. `on_thread` is called as soon as
+    the thread ID is known so the caller can persist it before a crash.
+    """
     args = [*launcher(), "exec", "--json", "-C", str(root), "-s", "workspace-write",
             "--skip-git-repo-check"]
     if model:
@@ -58,6 +75,9 @@ def execute(root, prompt, model=None, effort=None, thread=None, on_thread=None, 
                               stderr=errors, text=True, encoding="utf-8", errors="replace") as process:
             try:
                 for line in process.stdout:
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue  # Codex logs diagnostics on stdout; ignore non-events.
                     event = json.loads(line)
                     kind = event.get("type")
                     if kind == "thread.started":

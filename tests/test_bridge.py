@@ -42,7 +42,7 @@ class ProjectTest(unittest.TestCase):
         with patch.object(bridge, "execute", probe):
             self.cli("--project", str(root or self.root), "init")
 
-    def test_existing_instructions_survive_repeated_init(self):
+    def test_initialize_creates_state_and_keeps_existing_instructions(self):
         agents = self.root / "AGENTS.md"
         original = "已有规则\r\n".encode()
         agents.write_bytes(original)
@@ -53,56 +53,61 @@ class ProjectTest(unittest.TestCase):
         self.initialize()
         self.assertEqual(agents.read_bytes(), first)
         self.assertFalse(list(self.root.glob(".cc-codex/probe-*")))
+        self.assertEqual((self.root / ".cc-codex/.gitignore").read_text(), "*\n")
+        self.assertTrue(self.command("status")["ready"])
 
     def test_failed_recheck_blocks_dispatch_and_preserves_tasks(self):
         self.initialize()
-        task = self.command("new", "A", body="acceptance A")["id"]
+        task = self.command("task", "new", "A", body="acceptance A")["id"]
         with patch.object(bridge, "execute", return_value="claimed success"):
             with self.assertRaisesRegex(ValueError, "did not create"):
                 self.command("init")
             with self.assertRaisesRegex(ValueError, "before dispatch"):
-                self.command("run", task, body="implement")
-        self.assertEqual(self.command("show", task)["brief"], "acceptance A")
+                self.command("task", "run", task, body="implement")
+        self.assertEqual(self.command("task", "show", task)["brief"], "acceptance A")
+        self.assertFalse(self.command("status")["ready"])
 
     def test_switching_tasks_resumes_exact_thread_and_keeps_reviews(self):
         self.initialize()
-        a = self.command("new", "A", body="persist theme")["id"]
-        b = self.command("new", "B", body="fix login")["id"]
+        a = self.command("task", "new", "A", body="persist theme")["id"]
+        b = self.command("task", "new", "B", body="fix login")["id"]
+
         def worker(root, prompt, model, effort, thread, on_thread):
             on_thread(thread or str(uuid.uuid4()))
             return "ready for review"
 
         with patch.object(bridge, "execute", side_effect=worker) as dispatch:
-            self.command("run", a, "--model", "selected", "--effort", "high", body="implement A")
-            first = self.command("show", a)
-            self.command("run", b, body="implement B")
-            second = self.command("show", b)
+            self.command("task", "run", a, "--model", "selected", "--effort", "high", body="implement A")
+            first = self.command("task", "show", a)
+            self.command("task", "run", b, body="implement B")
+            second = self.command("task", "show", b)
             self.assertNotEqual(first["thread_id"], second["thread_id"])
-            self.command("run", a, body="adjust contrast")
+            self.command("task", "run", a, body="adjust contrast")
             self.assertEqual(dispatch.call_args.args[1:], (
                 "adjust contrast", "selected", "high", first["thread_id"]))
-            self.assertEqual(self.command("show", b), second)
-        self.command("checkpoint", a, "done", body="reviewed contrast")
-        self.assertEqual([row["id"] for row in self.command("list")], [b])
-        self.assertEqual(len(self.command("list", "--all")), 2)
+            self.assertEqual(self.command("task", "show", b), second)
+        self.command("task", "checkpoint", a, "done", body="reviewed contrast")
+        self.assertEqual([row["id"] for row in self.command("task", "list")], [b])
+        self.assertEqual(len(self.command("task", "list", "--all")), 2)
 
     def test_interrupted_run_requires_reconciliation_before_fresh_thread(self):
         self.initialize()
-        task = self.command("new", "theme", body="persist preference")["id"]
+        task = self.command("task", "new", "theme", body="persist preference")["id"]
         thread_id = str(uuid.uuid4())
+
         def interrupt(root, prompt, model, effort, thread, on_thread):
             on_thread(thread_id)
             raise SystemExit(99)  # Simulates loss of the parent after thread.started.
 
         with patch.object(bridge, "execute", side_effect=interrupt):
             with self.assertRaises(SystemExit):
-                self.command("run", task, body="implement")
-        self.assertEqual(self.command("show", task)["thread_id"], thread_id)
+                self.command("task", "run", task, body="implement")
+        self.assertEqual(self.command("task", "show", task)["thread_id"], thread_id)
         with self.assertRaisesRegex(ValueError, "interrupted"):
-            self.command("run", task, body="implement")
-        self.command("checkpoint", task, "planned", body="storage exists, UI is pending")
+            self.command("task", "run", task, body="implement")
+        self.command("task", "checkpoint", task, "planned", body="storage exists, UI is pending")
         with patch.object(bridge, "execute", return_value="fixed") as dispatch:
-            self.command("run", task, "--fresh", body="finish UI")
+            self.command("task", "run", task, "--fresh", body="finish UI")
             self.assertIsNone(dispatch.call_args.args[4])
             self.assertIn("storage exists", dispatch.call_args.args[1])
 
@@ -124,7 +129,7 @@ class ProjectTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "exit 17"):
                 codex_cli.execute(self.root, "retry")
 
-    def test_project_switch_preserves_each_windows_selection_and_dispatch_root(self):
+    def test_project_switch_preserves_each_session_selection_and_dispatch_root(self):
         other = self.root / "网站 后台"
         other.mkdir()
         self.initialize()
@@ -143,7 +148,7 @@ class ProjectTest(unittest.TestCase):
         self.assertEqual(one("status")["root"], str(other))
         self.assertEqual(two("status")["selected"]["id"], c["id"])
         with patch.object(bridge, "execute", return_value="implemented B") as dispatch:
-            one("run", "T1", body="implement it")
+            one("task", "run", "T1", body="implement it")
             self.assertEqual(dispatch.call_args.args[0], other)
             self.assertIn("dashboard", dispatch.call_args.args[1])
         one("project", "use", str(self.root))
@@ -153,16 +158,16 @@ class ProjectTest(unittest.TestCase):
 
     def test_legacy_task_refs_persist_across_new_tasks_and_updates(self):
         self.initialize()
-        old = self.command("new", "old", body="legacy brief")
+        old = self.command("task", "new", "old", body="legacy brief")
         path = self.root / bridge.STATE / "tasks" / (old["id"] + ".json")
         data = bridge.read(path)
         del data["number"]
         bridge.save(path, data)
         self.assertEqual(self.command("task", "list")[0]["ref"], "T1")
         self.assertNotIn("number", bridge.read(path))  # Viewing legacy records is read-only.
-        self.assertEqual(self.command("new", "next", body="new brief")["ref"], "T2")
-        self.command("checkpoint", "T1", "done", body="checked")
-        self.assertEqual(self.command("show", "T1")["id"], old["id"])
+        self.assertEqual(self.command("task", "new", "next", body="new brief")["ref"], "T2")
+        self.command("task", "checkpoint", "T1", "done", body="checked")
+        self.assertEqual(self.command("task", "show", "T1")["id"], old["id"])
         self.assertEqual([t["ref"] for t in self.command("task", "list")], ["T2"])
         self.assertEqual(len(self.command("task", "list", "--all")), 2)
 
