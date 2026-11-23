@@ -49,11 +49,13 @@ def model_catalog():
             for model in models if model.get("visibility") == "list"]
 
 
-def execute(root, prompt, model=None, effort=None, thread=None, on_thread=None, probe=False):
+def execute(root, prompt, model=None, effort=None, thread=None, on_thread=None, probe=False,
+            schema=None):
     """Run one Codex turn; return its final agent message.
 
     `thread` resumes an existing Codex thread. `on_thread` is called as soon as
     the thread ID is known so the caller can persist it before a crash.
+    `schema` is a JSON Schema file the final reply must follow.
     """
     args = [*launcher(), "exec", "--json", "-C", str(root), "-s", "workspace-write",
             "--skip-git-repo-check"]
@@ -63,6 +65,8 @@ def execute(root, prompt, model=None, effort=None, thread=None, on_thread=None, 
         args.extend(["-c", "model_reasoning_effort=" + json.dumps(effort)])
     if probe:
         args.append("--ephemeral")
+    if schema:
+        args.extend(["--output-schema", str(schema)])
     if thread:
         args.extend(["resume", str(uuid.UUID(thread))])
     args.append("-")

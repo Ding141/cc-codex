@@ -2,7 +2,8 @@
 name: status
 description: Show the cc-codex project selection, last environment check, and task checkpoints. Read-only.
 argument-hint: "[project name or path]"
-allowed-tools: Bash(python ${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py *) Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py *) Bash(py -3 ${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py *)
+allowed-tools: Bash(python "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *) Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *) Bash(py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *) PowerShell(python "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *) PowerShell(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *) PowerShell(py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.py" *)
+model: haiku
 ---
 
 Request: $ARGUMENTS

@@ -72,7 +72,7 @@ class ProjectTest(unittest.TestCase):
         a = self.command("task", "new", "A", body="persist theme")["id"]
         b = self.command("task", "new", "B", body="fix login")["id"]
 
-        def worker(root, prompt, model, effort, thread, on_thread):
+        def worker(root, prompt, model, effort, thread, on_thread, **options):
             on_thread(thread or str(uuid.uuid4()))
             return "ready for review"
 
@@ -95,7 +95,7 @@ class ProjectTest(unittest.TestCase):
         task = self.command("task", "new", "theme", body="persist preference")["id"]
         thread_id = str(uuid.uuid4())
 
-        def interrupt(root, prompt, model, effort, thread, on_thread):
+        def interrupt(root, prompt, model, effort, thread, on_thread, **options):
             on_thread(thread_id)
             raise SystemExit(99)  # Simulates loss of the parent after thread.started.
 
@@ -195,6 +195,81 @@ class ProjectTest(unittest.TestCase):
             self.command("--session", "b", "task", "use", task["ref"])
             self.assertEqual(self.command("--session", "b", "status")["selected"]["status"], "planned")
             self.assertIsNone(self.command("--session", "new-window", "status")["selected"])
+
+    def test_brief_file_starts_worker_thread_and_report_is_structured(self):
+        self.initialize()
+        brief = self.root / ".cc-codex" / "brief.md"
+        brief.write_text("目标：深色模式\n验收：刷新后保留", encoding="utf-8")
+        task = self.command("task", "new", "dark mode", "--input", str(brief))
+        report = {"outcome": "done", "summary": "ok", "changed_files": ["a.css"], "checks": [],
+                  "criteria": [{"criterion": "刷新后保留", "status": "met", "evidence": "test"}],
+                  "open_questions": []}
+        calls = []
+
+        def worker(root, prompt, model, effort, thread, on_thread, schema=None):
+            calls.append((prompt, thread, schema))
+            on_thread(thread or str(uuid.uuid4()))
+            return json.dumps(report, ensure_ascii=False)
+
+        with patch.object(bridge, "execute", side_effect=worker):
+            first = self.command("task", "run", task["ref"])  # No assignment on a new thread.
+            self.assertEqual(first["report"], report)
+            prompt, thread, schema = calls[-1]
+            self.assertIsNone(thread)
+            self.assertTrue(prompt.startswith(bridge.WORKER))
+            self.assertIn("刷新后保留", prompt)
+            self.assertEqual(schema, bridge.REPORT_SCHEMA)
+            self.assertTrue(schema.is_file())
+            with self.assertRaisesRegex(ValueError, "Expected a UTF-8 body"):
+                self.command("task", "run", task["ref"])  # A resumed thread needs new work.
+            fix = self.root / ".cc-codex" / "fix.md"
+            fix.write_text("提高对比度", encoding="utf-8")
+            self.command("task", "run", task["ref"], "--input", str(fix))
+            self.assertEqual(calls[-1][0], "提高对比度")
+        self.assertEqual(self.command("task", "show", task["ref"])["result"], report)
+        with patch.object(bridge, "execute", return_value="plain text"):
+            self.command("task", "run", task["ref"], "--fresh")
+        self.assertEqual(self.command("task", "show", task["ref"])["result"], {"raw": "plain text"})
+        with self.assertRaisesRegex(ValueError, "Cannot read --input"):
+            self.command("task", "checkpoint", task["ref"], "done", "--input", str(self.root / "missing"))
+
+    def test_render_uses_browser_outside_codex_and_never_fails_the_run(self):
+        self.initialize()
+        (self.root / "index.html").write_text("<p>hi</p>", encoding="utf-8")
+        launched = []
+
+        def browser(args, **kw):
+            launched.append(args)
+            shot = next(a for a in args if a.startswith("--screenshot="))[len("--screenshot="):]
+            Path(shot).write_bytes(b"png")
+
+        with patch.object(bridge.render, "browser", return_value="chrome"), \
+                patch.object(bridge.render.subprocess, "run", side_effect=browser):
+            shots = self.command("render", "index.html", "--width", "390")["screenshots"]
+        self.assertEqual([(s["width"], s["scheme"]) for s in shots], [(390, "light"), (390, "dark")])
+        self.assertTrue(all(Path(s["path"]).is_file() for s in shots))
+        self.assertFalse(any("--single-process" in a or "--no-sandbox" in a for a in launched[0]))
+        task = self.command("task", "new", "page", body="build page")["ref"]
+        with patch.object(bridge, "execute", return_value="{}"), \
+                patch.object(bridge.render, "browser", side_effect=ValueError("No Chrome")):
+            result = self.command("task", "run", task, "--render", "index.html")
+        self.assertEqual((result["status"], result["render_error"]), ("review", "No Chrome"))
+
+    def test_schema_flag_reaches_codex(self):
+        worker = self.root / "argv.py"
+        log = self.root / "argv.json"
+        session = str(uuid.uuid4())
+        worker.write_text(
+            "import json, sys\nsys.stdin.buffer.read()\n"
+            f"open({str(log)!r}, 'w').write(json.dumps(sys.argv))\n"
+            f"print(json.dumps({{'type': 'thread.started', 'thread_id': {session!r}}}))\n"
+            "print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '{}'}}))\n"
+            "print(json.dumps({'type': 'turn.completed'}))\n", encoding="utf-8")
+        with patch.object(codex_cli, "launcher", return_value=[sys.executable, str(worker)]):
+            codex_cli.execute(self.root, "x", schema=bridge.REPORT_SCHEMA, thread=session)
+        argv = json.loads(log.read_text())
+        self.assertEqual(argv[argv.index("--output-schema") + 1], str(bridge.REPORT_SCHEMA))
+        self.assertLess(argv.index("--output-schema"), argv.index("resume"))
 
 
 if __name__ == "__main__":

@@ -10,11 +10,13 @@ Every command prints one JSON document to stdout.
     bridge.py [--session ID] [--project ROOT] task list [--all]
     bridge.py [--session ID] [--project ROOT] task show REF
     bridge.py [--session ID] [--project ROOT] task use REF
-    bridge.py [--session ID] [--project ROOT] task new TITLE
-    bridge.py [--session ID] [--project ROOT] task checkpoint REF STATUS
+    bridge.py [--session ID] [--project ROOT] task new TITLE [--input FILE]
+    bridge.py [--session ID] [--project ROOT] task checkpoint REF STATUS [--input FILE]
     bridge.py [--session ID] [--project ROOT] task run REF [--model M] [--effort E] [--fresh]
+                                              [--input FILE] [--render PAGE]
+    bridge.py [--session ID] [--project ROOT] render PAGE [--width W]... [--scheme S]...
 
-Text bodies (brief, checkpoint, assignment) are read from UTF-8 stdin.
+Text bodies (brief, checkpoint, assignment) come from --input FILE or UTF-8 stdin.
 """
 
 import argparse
@@ -31,15 +33,27 @@ import sys
 import tempfile
 import uuid
 
+import subprocess
+
 from codex_cli import execute, model_catalog
 import navigation
+import render
 
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
+REPORT_SCHEMA = TEMPLATES / "report.schema.json"
 BEGIN = b"<!-- cc-codex:begin -->"
 END = b"<!-- cc-codex:end -->"
 STATE = ".cc-codex"
 STATUSES = ("planned", "running", "review", "blocked", "done")
+
+# Sent once at the start of every Codex thread. Resumed turns inherit it.
+WORKER = """\
+You are the implementation worker for this task. Claude planned it and will review your report; the user talks only to Claude.
+Work on your own until every acceptance criterion is met or you are blocked: plan the steps, implement, add or update tests, run them, fix failures, then check the diff against each criterion. Choose engineering details yourself. Stop and report instead of guessing about product behaviour, public interfaces or scope.
+When the work depends on facts (dates, versions, API behaviour), verify them yourself and name the source in the evidence, so Claude does not have to research them again.
+Do not start browsers or other GUI programs (Chrome, Edge, Firefox, Playwright, Electron), even headless, and do not download browsers. They cannot run in this sandbox, and their crashes open error dialogs on the user's desktop. Check UI work statically (HTML parsing, jsdom, unit tests); the bridge takes screenshots for Claude after you finish.
+Your final reply is a JSON report: outcome, summary, changed_files, checks (each command you ran and whether it passed), criteria (each acceptance criterion: met, unmet or unverified, with concrete evidence), open_questions. Write the text in the language of the brief and keep it short."""
 
 
 def timestamp():
@@ -170,17 +184,62 @@ def initialize(root, state, args):
     return result
 
 
-def stdin_text(required=True):
+def stdin_text(required=True, source=None):
+    """Read a prose body from `--input FILE`, else from UTF-8 stdin.
+
+    A file keeps the shell command a single plain call, which permission
+    rules can match without pipes, variables or console-encoding setup.
+    """
     body = ""
-    stream = getattr(sys.stdin, "buffer", None)
-    if stream is not None:
+    if source:
         try:
-            body = stream.read().decode("utf-8-sig").strip()
-        except (OSError, AttributeError):
-            body = ""
+            body = Path(source).expanduser().read_bytes().decode("utf-8-sig").strip()
+        except OSError as exc:
+            raise ValueError(f"Cannot read --input file: {source}") from exc
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"--input file is not UTF-8: {source}") from exc
+    else:
+        stream = getattr(sys.stdin, "buffer", None)
+        if stream is not None and not (hasattr(stream, "isatty") and stream.isatty()):
+            try:
+                body = stream.read().decode("utf-8-sig").strip()
+            except (OSError, AttributeError, ValueError):
+                body = ""
     if not body and required:
-        raise ValueError("Expected a UTF-8 task brief or checkpoint on stdin.")
+        raise ValueError("Expected a UTF-8 body: pass --input FILE or pipe it on stdin.")
     return body
+
+
+def parse_report(message):
+    try:
+        report = json.loads(message)
+    except (TypeError, ValueError):
+        return {"raw": message}
+    return report if isinstance(report, dict) else {"raw": message}
+
+
+def git_changes(root, limit=40):
+    """Short working-tree status, or None outside a Git repository."""
+    try:
+        result = subprocess.run(["git", "-C", str(root), "status", "--short",
+                                 "--untracked-files=all"], capture_output=True, timeout=20,
+                                text=True, encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    lines = result.stdout.splitlines()
+    return lines[:limit] + ([f"... {len(lines) - limit} more"] if len(lines) > limit else [])
+
+
+def screenshots(root, state, target, widths=None, schemes=None, height=None):
+    shots = state / "shots"
+    if shots.is_symlink():
+        raise ValueError("Use project-local cc-codex state.")
+    for old in shots.glob("*.png") if shots.is_dir() else ():
+        old.unlink()
+    return render.render(root, target, shots, widths=widths or render.WIDTHS,
+                         schemes=schemes or render.SCHEMES, height=height or 2400)
 
 
 def task_records(state, migrate=False):
@@ -249,12 +308,12 @@ def require_ready(state):
         raise ValueError("Run /cc-codex:init successfully before dispatch.")
 
 
-def task_new(state, session, title):
+def task_new(state, session, title, source=None):
     records = task_records(state, migrate=True)
     (state / "tasks").mkdir(exist_ok=True)
     task = {"id": uuid.uuid4().hex,
             "number": max((t["number"] for t in records), default=0) + 1,
-            "title": title, "brief": stdin_text(required=False) or title,
+            "title": title, "brief": stdin_text(False, source) or title,
             "status": "planned", "thread_id": None, "updated": timestamp()}
     save(state / "tasks" / (task["id"] + ".json"), task)
     if session:
@@ -271,12 +330,19 @@ def task_run(root, state, args):
     path = state / "tasks" / (task["id"] + ".json")
     if task["status"] == "running":
         raise ValueError("Inspect the interrupted run and checkpoint its actual state first.")
-    assignment = stdin_text()
     thread = None if args.fresh else task["thread_id"]
+    # A new thread starts from the brief, so the first run needs no assignment.
+    assignment = stdin_text(required=bool(thread), source=args.input)
     prompt = assignment
     if not thread:
-        prompt = "\n".join(filter(None, [task["brief"], task.get("checkpoint"),
-                                        task.get("result"), assignment]))
+        previous = task.get("result")
+        if isinstance(previous, dict):
+            previous = json.dumps(previous, ensure_ascii=False)
+        prompt = "\n\n".join(filter(None, [
+            WORKER, "## Brief\n" + task["brief"],
+            task.get("checkpoint") and "## Progress so far\n" + task["checkpoint"],
+            previous and "## Last report\n" + previous,
+            assignment and "## This run\n" + assignment]))
     model = args.model or task.get("model")
     effort = args.effort or task.get("effort")
 
@@ -284,21 +350,34 @@ def task_run(root, state, args):
         task.update(changes, updated=timestamp())
         save(path, task)
 
-    persist(status="running", assignment=assignment, model=model, effort=effort, error=None)
+    persist(status="running", assignment=assignment or None, model=model, effort=effort,
+            error=None)
     try:
-        result = execute(root, prompt, model, effort, thread,
-                         on_thread=lambda value: persist(thread_id=value))
+        message = execute(root, prompt, model, effort, thread,
+                          on_thread=lambda value: persist(thread_id=value),
+                          schema=REPORT_SCHEMA)
     except (OSError, RuntimeError, ValueError, KeyboardInterrupt) as exc:
         persist(status="blocked", error=str(exc) or "Interrupted")
         raise
-    persist(status="review", result=result)
-    return {"id": task["id"], "ref": f"T{task['number']}", "status": task["status"],
-            "result": result}
+    report = parse_report(message)
+    persist(status="review", result=report)
+    reply = {"id": task["id"], "ref": f"T{task['number']}", "status": task["status"],
+             "report": report}
+    changes = git_changes(root)
+    if changes is not None:
+        reply["git_status"] = changes
+    if args.render:
+        try:
+            reply["screenshots"] = screenshots(root, state, args.render)
+        except (OSError, ValueError) as exc:
+            reply["render_error"] = str(exc)
+    return reply
 
 
 def task_checkpoint(state, args):
     task = resolve_task(state, args.id)
-    task.update(status=args.status, checkpoint=stdin_text(), error=None, updated=timestamp())
+    task.update(status=args.status, checkpoint=stdin_text(source=args.input), error=None,
+                updated=timestamp())
     save(state / "tasks" / (task["id"] + ".json"), task)
     return task_summary(task)
 
@@ -342,19 +421,32 @@ def main():
     project.add_parser("list")
     project.add_parser("use").add_argument("target")
 
+    shot = commands.add_parser("render", help="screenshot a page for review (no Codex call)")
+    shot.add_argument("page", help="file under the project root, or a URL")
+    shot.add_argument("--width", type=int, action="append")
+    shot.add_argument("--scheme", choices=render.SCHEMES, action="append")
+    shot.add_argument("--height", type=int)
+
+    body = "UTF-8 file holding the body (instead of stdin)"
     tasks = commands.add_parser("task").add_subparsers(dest="action", required=True)
     tasks.add_parser("list").add_argument("--all", action="store_true")
     tasks.add_parser("show").add_argument("id")
     tasks.add_parser("use").add_argument("id")
-    tasks.add_parser("new").add_argument("title")
+    new = tasks.add_parser("new")
+    new.add_argument("title")
+    new.add_argument("--input", help=body)
     checkpoint = tasks.add_parser("checkpoint")
     checkpoint.add_argument("id")
     checkpoint.add_argument("status", choices=STATUSES)
+    checkpoint.add_argument("--input", help=body)
     run = tasks.add_parser("run")
     run.add_argument("id")
     run.add_argument("--model")
     run.add_argument("--effort")
     run.add_argument("--fresh", action="store_true", help="start a replacement Codex thread")
+    run.add_argument("--input", help=body)
+    run.add_argument("--render", metavar="PAGE",
+                     help="screenshot this page after Codex finishes")
 
     args = parser.parse_args()
     if args.command == "models":
@@ -395,6 +487,9 @@ def main():
 
     if not (state / "project.json").is_file():
         raise ValueError("Initialize this project with /cc-codex:init.")
+    if args.command == "render":
+        return {"screenshots": screenshots(root, state, args.page, args.width, args.scheme,
+                                           args.height)}
     action = args.action
 
     with writer(state):
@@ -404,7 +499,7 @@ def main():
             navigation.remember(root, args.session)
             return {**result, "project": root.name, "root": str(root)}
         if action == "new":
-            return task_new(state, args.session, args.title)
+            return task_new(state, args.session, args.title, args.input)
         if action == "use":
             task = resolve_task(state, args.id)
             navigation.remember(root, args.session, task["id"])
