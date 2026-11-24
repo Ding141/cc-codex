@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 WIDTHS = (1440, 390)
+VIEWPORT_HEIGHT = {1440: 900, 390: 844}  # desktop and phone first screens
 SCHEMES = ("light", "dark")
 
 
@@ -42,6 +43,11 @@ def browser():
         found = shutil.which(name)
         if found:
             return found
+    # Playwright's bundled Chromium, for machines without a system browser.
+    for cache in (os.environ.get("PLAYWRIGHT_BROWSERS_PATH"), Path.home() / ".cache/ms-playwright"):
+        for found in sorted(Path(cache).glob("chromium-*/chrome-linux*/chrome")) if cache else ():
+            if found.is_file():
+                return str(found)
     raise ValueError("No Chrome, Edge or Chromium found. Set CC_CODEX_BROWSER to its executable.")
 
 
@@ -55,8 +61,12 @@ def target_url(root, target):
     return path.as_uri()
 
 
-def render(root, target, out_dir, widths=WIDTHS, schemes=SCHEMES, height=2400):
-    """Return [{"width", "scheme", "path"}] for every width x colour scheme."""
+def render(root, target, out_dir, widths=WIDTHS, schemes=SCHEMES, height=None):
+    """Return [{"width", "scheme", "path"}] for every width x colour scheme.
+
+    Without `height` each width gets a real first-screen viewport; pass one to
+    capture a taller page.
+    """
     program = browser()
     url = target_url(root, target)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,10 +74,11 @@ def render(root, target, out_dir, widths=WIDTHS, schemes=SCHEMES, height=2400):
     with tempfile.TemporaryDirectory(prefix="cc-codex-render-") as work:
         work = Path(work)
         for width in widths:
+            tall = height or VIEWPORT_HEIGHT.get(width, 900)
             wrapper = work / f"w{width}.html"
             wrapper.write_text(
                 "<!doctype html><meta charset=\"utf-8\"><style>html,body{margin:0}"
-                f"iframe{{border:0;display:block;width:{width}px;height:{height}px}}</style>"
+                f"iframe{{border:0;display:block;width:{width}px;height:{tall}px}}</style>"
                 f"<iframe src=\"{html.escape(url)}\"></iframe>", encoding="utf-8")
             for scheme in schemes:
                 shot = out_dir / f"{width}-{scheme}.png"
@@ -77,7 +88,7 @@ def render(root, target, out_dir, widths=WIDTHS, schemes=SCHEMES, height=2400):
                         "--force-device-scale-factor=1", "--allow-file-access-from-files",
                         "--user-data-dir=" + str(work / "profile"),
                         "--blink-settings=preferredColorScheme=" + ("0" if scheme == "dark" else "1"),
-                        "--virtual-time-budget=2500", f"--window-size={width},{height}",
+                        "--virtual-time-budget=2500", f"--window-size={width},{tall}",
                         "--screenshot=" + str(shot), wrapper.as_uri()]
                 try:
                     subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

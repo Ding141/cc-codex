@@ -27,6 +27,8 @@ class ProjectTest(unittest.TestCase):
         return self.cli("--project", str(self.root), *args, body=body)
 
     def cli(self, *args, body=""):
+        if body:
+            args += ("--input", "-")
         stream = io.TextIOWrapper(io.BytesIO(body.encode("utf-8")))
         with patch.object(sys, "argv", ["bridge", *args]), \
                 patch.object(sys, "stdin", stream):
@@ -254,6 +256,47 @@ class ProjectTest(unittest.TestCase):
                 patch.object(bridge.render, "browser", side_effect=ValueError("No Chrome")):
             result = self.command("task", "run", task, "--render", "index.html")
         self.assertEqual((result["status"], result["render_error"]), ("review", "No Chrome"))
+
+    def test_stdin_is_read_only_for_explicit_dash_input(self):
+        class Forbidden:
+            @property
+            def buffer(self):
+                raise AssertionError("stdin must not be read without --input -")
+
+        self.initialize()
+        with patch.object(sys, "argv", ["bridge", "--project", str(self.root), "task", "new", "t"]), \
+                patch.object(sys, "stdin", Forbidden()):
+            task = bridge.main()
+        with patch.object(bridge, "execute", return_value="{}"), \
+                patch.object(sys, "argv", ["bridge", "--project", str(self.root), "task", "run", task["ref"]]), \
+                patch.object(sys, "stdin", Forbidden()):
+            self.assertEqual(bridge.main()["status"], "review")
+
+    def test_render_defaults_to_real_viewports_and_height_overrides(self):
+        self.initialize()
+        (self.root / "index.html").write_text("<p>hi</p>", encoding="utf-8")
+        sizes = []
+
+        def browser(args, **kw):
+            sizes.append(next(a for a in args if a.startswith("--window-size=")))
+            Path(next(a for a in args if a.startswith("--screenshot="))[len("--screenshot="):]).write_bytes(b"png")
+
+        with patch.object(bridge.render, "browser", return_value="chrome"), \
+                patch.object(bridge.render.subprocess, "run", side_effect=browser):
+            self.command("render", "index.html", "--scheme", "light")
+            self.command("render", "index.html", "--scheme", "light", "--width", "390", "--height", "3000")
+        self.assertEqual(sizes, ["--window-size=1440,900", "--window-size=390,844", "--window-size=390,3000"])
+
+    def test_new_files_follow_the_umask(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permissions only")
+        old = os.umask(0o022)
+        try:
+            target = self.root / "fresh.md"
+            bridge.atomic_write(target, b"x")
+        finally:
+            os.umask(old)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
 
     def test_schema_flag_reaches_codex(self):
         worker = self.root / "argv.py"

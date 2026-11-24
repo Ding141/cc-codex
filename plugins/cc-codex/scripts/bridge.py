@@ -16,7 +16,7 @@ Every command prints one JSON document to stdout.
                                               [--input FILE] [--render PAGE]
     bridge.py [--session ID] [--project ROOT] render PAGE [--width W]... [--scheme S]...
 
-Text bodies (brief, checkpoint, assignment) come from --input FILE or UTF-8 stdin.
+Text bodies (brief, checkpoint, assignment) come from --input FILE, or UTF-8 stdin with --input -.
 """
 
 import argparse
@@ -76,6 +76,10 @@ def atomic_write(path, data):
     try:
         if path.exists():
             temp.chmod(path.stat().st_mode)
+        elif os.name != "nt":
+            umask = os.umask(0)
+            os.umask(umask)
+            temp.chmod(0o666 & ~umask)  # mkstemp creates 0600; new files should follow the umask
         temp.replace(path)
     finally:
         temp.unlink(missing_ok=True)
@@ -185,28 +189,25 @@ def initialize(root, state, args):
 
 
 def stdin_text(required=True, source=None):
-    """Read a prose body from `--input FILE`, else from UTF-8 stdin.
+    """Read a prose body from `--input FILE`, or from stdin for `--input -`.
 
     A file keeps the shell command a single plain call, which permission
     rules can match without pipes, variables or console-encoding setup.
+    Stdin is never read implicitly: under an agent shell it is an open pipe
+    that never closes, so an implicit read would hang the command.
     """
     body = ""
-    if source:
+    if source == "-":
+        body = sys.stdin.buffer.read().decode("utf-8-sig").strip()
+    elif source:
         try:
             body = Path(source).expanduser().read_bytes().decode("utf-8-sig").strip()
         except OSError as exc:
             raise ValueError(f"Cannot read --input file: {source}") from exc
         except UnicodeDecodeError as exc:
             raise ValueError(f"--input file is not UTF-8: {source}") from exc
-    else:
-        stream = getattr(sys.stdin, "buffer", None)
-        if stream is not None and not (hasattr(stream, "isatty") and stream.isatty()):
-            try:
-                body = stream.read().decode("utf-8-sig").strip()
-            except (OSError, AttributeError, ValueError):
-                body = ""
     if not body and required:
-        raise ValueError("Expected a UTF-8 body: pass --input FILE or pipe it on stdin.")
+        raise ValueError("Expected a UTF-8 body: pass --input FILE (or --input - for stdin).")
     return body
 
 
@@ -239,7 +240,7 @@ def screenshots(root, state, target, widths=None, schemes=None, height=None):
     for old in shots.glob("*.png") if shots.is_dir() else ():
         old.unlink()
     return render.render(root, target, shots, widths=widths or render.WIDTHS,
-                         schemes=schemes or render.SCHEMES, height=height or 2400)
+                         schemes=schemes or render.SCHEMES, height=height)
 
 
 def task_records(state, migrate=False):
@@ -427,7 +428,7 @@ def main():
     shot.add_argument("--scheme", choices=render.SCHEMES, action="append")
     shot.add_argument("--height", type=int)
 
-    body = "UTF-8 file holding the body (instead of stdin)"
+    body = "UTF-8 file holding the body ('-' reads stdin)"
     tasks = commands.add_parser("task").add_subparsers(dest="action", required=True)
     tasks.add_parser("list").add_argument("--all", action="store_true")
     tasks.add_parser("show").add_argument("id")

@@ -36,7 +36,7 @@ Run `status` once. Use its absolute root for every later call, read and diff. If
 ## 3. Dispatch
 
 - First run of a task: `task run REF` with no `--input`; the bridge sends the brief and the worker contract. Later runs: `--input` with only the new instructions, because the Codex thread keeps its context.
-- For UI work, add `--render <page>`. The bridge takes desktop and mobile screenshots in light and dark after Codex finishes. Codex cannot run browsers in its sandbox, so screenshots come from here.
+- For UI work, add `--render <page>`. The bridge takes desktop and mobile screenshots in light and dark after Codex finishes. Codex cannot run browsers in its sandbox, so screenshots come from here. `<page>` is a file under the project or a URL; for a bundled project (Vite, a dev server) start the server yourself in the background and pass its `http://localhost:...` URL. For a taller capture use `render PAGE --height N` (default: first screen, 1440x900 and 390x844).
 - Codex runs take minutes. **Start `task run` with `run_in_background: true`** and tell the user it is running. You are notified when it finishes. Do not poll, sleep, or read Codex logs in the meantime.
 - `--model` / `--effort`: honour the user's choice. Otherwise omit both (the Codex default), or pick a higher effort for uncertain cross-module work. Call `models` only when the user asks which models exist.
 - The bridge saves the thread ID immediately and resumes it on later runs. On failure the task becomes `blocked` with the error saved. If the native thread is gone, use `--fresh` on the same task.
